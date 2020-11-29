@@ -9,38 +9,30 @@ import pylxd
 class Node:
     """A test node used to run functional tests"""
 
-    # @classmethod
-    # def create(cls):
-
-    #     pass
+    pass
 
 
 # @pytest.mark.lxd
 class LXD(Node):
     """LXD Node type for testing in containers"""
 
-    @classmethod
-    def create(cls):
-        """Create a new node"""
+    def __init__(self, image):
         print("Creating a LXD node")
-        print(f"Image: {cls.image}")
+        print(f"Image: {image}")
         client = pylxd.Client()
-        node = cls()
         config = {
-            'name': f'{node.__class__.__name__}-{node.__hash__()}',
+            'name': f'{self.__class__.__name__}-{self.__hash__()}',
             'source': {
                 'type': 'image',
                 "mode": "pull",
                 "server": "https://cloud-images.ubuntu.com/daily",
                 "protocol": "simplestreams",
-                'alias': cls.image,
+                'alias': image,
             },
             # 'profiles': ['profilename'],
         }
 
-        node.container = client.containers.create(config=config, wait=True)
-
-        return node
+        self.container = client.containers.create(config=config, wait=True)
 
     def start(self):
         """Start the node"""
@@ -79,47 +71,38 @@ class Executor:
         pass
 
 
-# class Distro:
-#     """Base class for distor tests to inherit common functionality from"""
-#
-#     pass
-
-
 class XenialLxd(LXD):
     """Sets up Xenial"""
 
-    image = "xenial/amd64"
+    def __init__(self):
+        super().__init__("xenial/amd64")
 
 
 class BionicLxd(LXD):
     """Sets up Xenial"""
 
-    image = "bionic/amd64"
-
-
-# @pytest.mark.localhost
-# class Localhost(Distro):
-#     """Distro for running locally"""
-#
-#     pass
+    def __init__(self):
+        super().__init__("bionic/amd64")
 
 
 class UpgradeTests:
     """Upgrade Test Mixin"""
 
-    # def setup_class(self):
-    #     """Setup the tests"""
-    #     print("Setting up Upgrade tests")
-    #     self.node = self.create()
-    #     assert isinstance(self.node, Node)
-    #     self.node.start()
-    #     self.ex = Executor(self.node)
-    #     print(f"Node: {self.node}")
+    node_type = None
 
-    # def teardown_class(self):
-    #     print("Tearing down Upgrade tests")
-    #     self.node.stop()
-    #     self.node.delete()
+    def setup_class(self):
+        """Setup the tests"""
+        print("Setting up Upgrade tests")
+        self.node = self.node_type()
+        assert isinstance(self.node, Node)
+        self.node.start()
+        # self.ex = Executor(self.node)
+        print(f"Node: {self.node}")
+
+    def teardown_class(self):
+        print("Tearing down Upgrade tests")
+        self.node.stop()
+        self.node.delete()
 
     def test_collection(self):
         """Test that this test is collected"""
@@ -130,36 +113,26 @@ class UpgradeTests:
         """Test that expceted nodes exist"""
         assert self.node
 
-    def test_snap_install(self):
-        """Test installing a snap"""
-        self.node.snap.install("microk8s", channel="1.19/stable")
-        pass
+    # def test_snap_install(self):
+    #     """Test installing a snap"""
+    #     self.node.snap.install("microk8s", channel="1.19/stable")
+    #     pass
 
     def test_long_tests(self):
         """This is just a tests"""
-        time.sleep(30)
+        time.sleep(1)
 
 
-# class TestXenialUpgrades(UpgradeTests, LXD):
-#     """Test with Upgrades on Xenial LXD"""
-#
-#     image = "ubuntu:xenial"
-
-# @pytest.fixture()
-# def node(request):
-#     """Fixture for settingup nodes"""
-#
-#     pass
-
-
-class TestXenialLXDUpgrade(XenialLxd, UpgradeTests):
+class TestXenialUpgrade(UpgradeTests):
     """Run Upgrade tests on a Xeinal node"""
 
-    pass
+    node_type = XenialLxd
 
 
-class TestBionicLXDUpgrade(BionicLxd, UpgradeTests):
+class TestBionicLXDUpgrade(UpgradeTests):
     """Run Upgrade tests on a Xeinal node"""
+
+    node_type = BionicLxd
 
     pass
 

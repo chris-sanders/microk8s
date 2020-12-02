@@ -14,6 +14,10 @@ import kubernetes
 import pylxd
 
 
+class NotFound(Exception):
+    pass
+
+
 class Node:
     """A test node used to run tests"""
 
@@ -122,17 +126,17 @@ class Executor:
 
         return self.node.check_output(full_cmd)
 
-    def run_until_success(self, cmd, timeout_sec=60):
+    def run_until_success(self, cmd, timeout=60):
         """
         Run a command until it succeeds or times out.
         Args:
             cmd: Command to run
-            timeout_insec: Time out in seconds
+            timeout: Time out in seconds
 
         Returns: The string output of the command
 
         """
-        deadline = datetime.datetime.now() + datetime.timedelta(seconds=timeout_sec)
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=timeout)
 
         while True:
             try:
@@ -203,7 +207,7 @@ class Microk8s(Executor):
             if "microk8s is running" in status:
                 return
             elif datetime.datetime.now > deadline:
-                raise TimeoutError("Timedout waiting for microk8s status")
+                raise TimeoutError("Timeout waiting for microk8s status")
             time.sleep(1)
 
     def wait_until_service_running(self, service, timeout=60):
@@ -222,22 +226,22 @@ class Microk8s(Executor):
             if "active" in service_status:
                 return
             elif datetime.datetime.now() > deadline:
-                raise TimeoutError(f"Timedout waiting for {service} to become active")
+                raise TimeoutError(f"Timeout waiting for {service} to become active")
             time.sleep(1)
 
 
 class RetryWrapper:
     """Generic class for retyring method calls on an object"""
 
-    def __init__(self, object, exception=Exception, count=3):
+    def __init__(self, object, exception=Exception, timeout=60):
         self.object = object
         self.exception = exception
-        self.count = count
+        self.timeout = timeout
 
     def __getattribute__(self, name, *args, **kwargs):
         object = super().__getattribute__("object")
         exception = super().__getattribute__("exception")
-        count = super().__getattribute__("count")
+        timeout = super().__getattribute__("timeout")
 
         if not hasattr(object, name):
             raise AttributeError(f"No {name} on {type(object)}")
@@ -248,7 +252,7 @@ class RetryWrapper:
                 return attr
 
             def wrapped(*args, **kwargs):
-                loop = 1
+                deadline = datetime.datetime.now() + datetime.timedelta(seconds=timeout)
 
                 while True:
                     try:
@@ -256,9 +260,8 @@ class RetryWrapper:
 
                         return result
                     except exception as e:
-                        if loop >= count:
+                        if datetime.datetime.now() >= deadline:
                             raise e
-                        loop += 1
                         time.sleep(1)
 
             return wrapped
@@ -304,38 +307,38 @@ class Kubernetes:
             if ready_count >= count:
                 return count
             elif datetime.datetime.now() > deadline:
-                raise TimeoutError(f"Timed out waiting {ready_count} of {count} Ready")
+                raise TimeoutError(f"Timeout waiting {ready_count} of {count} Ready")
 
-    # def create_namespace(self, namespace):
-    #     """Create a namespace"""
+    def create_namespace(self, namespace):
+        """Create a namespace"""
 
-    #     metadata = client.V1ObjectMeta(name=namespace)
-    #     namespace = client.V1Namespace(metadata=metadata)
-    #     api_response = self.core_v1_api.create_namespace(namespace)
+        metadata = kubernetes.client.V1ObjectMeta(name=namespace)
+        namespace = kubernetes.client.V1Namespace(metadata=metadata)
+        api_response = self.api.create_namespace(namespace)
 
-    #     return api_response
+        return api_response
 
-    # def get_service_cluster_ip(self, namespace, name):
-    #     """Get an IP for a service by name"""
-    #     service_list = self.core_v1_api.list_namespaced_service(namespace)
+    def get_service_cluster_ip(self, namespace, name):
+        """Get an IP for a service by name"""
+        service_list = self.api.list_namespaced_service(namespace)
 
-    #     if not service_list.items:
-    #         raise NotFound(f"No services in namespace {namespace}")
+        if not service_list.items:
+            raise NotFound(f"No services in namespace {namespace}")
 
-    #     for service in service_list.items:
-    #         if service.metadata.name == name:
-    #             return service.spec.cluster_ip
+        for service in service_list.items:
+            if service.metadata.name == name:
+                return service.spec.cluster_ip
 
-    #     raise NotFound(f"cluster_ip not found for {name} in {namespace}")
+        raise NotFound(f"cluster_ip not found for {name} in {namespace}")
 
-    # def get_pod_by_label(self, namespace, label):
-    #     """Get a pod by lable"""
-    #     pod_list = self.core_v1_api.list_namespaced_pod(namespace, label_selector=label)
+    def get_pod_by_label(self, namespace, label):
+        """Get a pod by lable"""
+        pod_list = self.api.list_namespaced_pod(namespace, label_selector=label)
 
-    #     if not pod_list.items:
-    #         raise NotFound(f"No pods in namespace {namespace} with label {label}")
+        if not pod_list.items:
+            raise NotFound(f"No pods in namespace {namespace} with label {label}")
 
-    #     return pod_list.items
+        return pod_list.items
 
     def all_containers_ready(self, namespace, label=None):
         """Check if all containers in all pods are ready"""
@@ -367,7 +370,7 @@ class Kubernetes:
             if self.all_containers_ready(namespace, label):
                 return
             elif datetime.datetime.now() > deadline:
-                raise TimeoutError(f"Timed out waiting for containers in {namespace}")
+                raise TimeoutError(f"Timeout waiting for containers in {namespace}")
             else:
                 time.sleep(1)
 
@@ -433,7 +436,9 @@ class InstallTests:
         result = self.node.microk8s.enable(["dns"])
         assert "Nothing to do for" not in result
         self.node.kubernetes.api.api_client.close()
-        self.node.kubernetes.wait_containers_ready("kube-system", label="k8s-app=kube-dns")
+        self.node.kubernetes.wait_containers_ready(
+            "kube-system", label="k8s-app=kube-dns", timeout=120
+        )
 
     def test_dashboard(self):
         """Test dashboard addon"""

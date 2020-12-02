@@ -1,12 +1,12 @@
 #!/bin/env python3
 
+from distutils.util import strtobool
+from pathlib import Path
+from subprocess import CalledProcessError, CompletedProcess
 import datetime
 import inspect
 import os
 import time
-from distutils.util import strtobool
-from pathlib import Path
-from subprocess import CalledProcessError, CompletedProcess
 
 import yaml
 
@@ -110,6 +110,16 @@ class BionicLxd(LXD):
             super().__init__(name=name)
         else:
             super().__init__(image="bionic/amd64")
+
+
+class FocalLxd(LXD):
+    """Focal LXD Node"""
+
+    def __init__(self, name=None):
+        if name:
+            super().__init__(name=name)
+        else:
+            super().__init__(image="focal/amd64")
 
 
 class Executor:
@@ -450,12 +460,6 @@ class InstallTests:
             "kube-system", label="k8s-app=dashboard-metrics-scraper"
         )
 
-    def test_dns2(self):
-        """Test dns_dashboard addons"""
-        result = self.node.microk8s.enable(["dns"])
-        assert "Nothing to do for" not in result
-        self.node.kubernetes.wait_containers_ready("kube-system", label="k8s-app=kube-dns")
-
 
 class UpgradeTests(InstallTests):
     """Upgrade after an install"""
@@ -470,6 +474,12 @@ class TestXenialUpgrade(UpgradeTests):
 
 
 class TestBionicUpgrade(UpgradeTests):
-    """Run Upgrade tests on a Xeinal node"""
+    """Run Upgrade tests on a Bionic node"""
 
     node_type = BionicLxd
+
+
+# class TestFocalUpgrade(UpgradeTests):
+#     """Run Upgrade tests on a Focal node"""
+#
+#     node_type = FocalLxd

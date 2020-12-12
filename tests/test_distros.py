@@ -174,10 +174,56 @@ class Snap(Executor):
         self.run_until_success(cmd)
 
 
+class Addon:
+    """Base class for testing Microk8s addons"""
+
+    name = None
+
+    def __init__(self, node):
+        self.node = node
+
+    def enable(self):
+        return self.node.microk8s.enable([self.name])
+
+
+class Dns(Addon):
+    """Microk8s dns addon"""
+
+    name = "dns"
+
+    def validate(self):
+        self.node.kubernetes.wait_containers_ready(
+            "kube-system", label="k8s-app=kube-dns", timeout=120
+        )
+
+
+class Dashboard(Addon):
+    """Dashboard addon"""
+
+    name = "dashboard"
+
+    def validate(self):
+        self.node.kubernetes.wait_containers_ready(
+            "kube-system", label="k8s-app=kubernetes-dashboard", timeout=90,
+        )
+        self.node.kubernetes.wait_containers_ready(
+            "kube-system", label="k8s-app=dashboard-metrics-scraper"
+        )
+        name = "https:kubernetes-dashboard:"
+        result = self.node.kubernetes.get_service_proxy(name=name, namespace="kube-system")
+        print(result)
+        assert "Kubernetes Dashboard" in result
+
+
 class Microk8s(Executor):
     """Node aware MicroK8s executor"""
 
     prefix = ["/snap/bin/microk8s"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dns = Dns(self.node)
+        self.dashboard = Dashboard(self.node)
 
     @property
     def config(self):
@@ -317,6 +363,20 @@ class Kubernetes:
             return self.config
 
         return self.node.microk8s.config
+
+    def get_service_proxy(self, name, namespace, path=None):
+        """Return a GET call to a proxied service"""
+
+        if path:
+            response = self.node.kubernetes.api.connect_get_namespaced_service_proxy(
+                name, namespace, path
+            )
+        else:
+            response = self.node.kubernetes.api.connect_get_namespaced_service_proxy(
+                name, namespace
+            )
+
+        return response
 
     def wait_nodes_ready(self, count, timeout=60):
         """Wait for nodes to become ready"""
@@ -460,22 +520,14 @@ class InstallTests:
 
     def test_dns(self):
         """Test dns_dashboard addons"""
-        result = self.node.microk8s.enable(["dns"])
+        result = self.node.microk8s.dns.enable()
         assert "Nothing to do for" not in result
-        self.node.kubernetes.api.api_client.close()
-        self.node.kubernetes.wait_containers_ready(
-            "kube-system", label="k8s-app=kube-dns", timeout=120
-        )
+        self.node.microk8s.dns.validate()
 
     def test_dashboard(self):
         """Test dashboard addon"""
-        self.node.microk8s.enable(["dashboard"])
-        self.node.kubernetes.wait_containers_ready(
-            "kube-system", label="k8s-app=kubernetes-dashboard", timeout=90,
-        )
-        self.node.kubernetes.wait_containers_ready(
-            "kube-system", label="k8s-app=dashboard-metrics-scraper"
-        )
+        self.node.microk8s.dashboard.enable()
+        self.node.microk8s.dashboard.validate()
 
 
 class UpgradeTests(InstallTests):

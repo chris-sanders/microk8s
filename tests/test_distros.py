@@ -67,7 +67,7 @@ class LXD(Node):
         pfile = cwd / 'lxc' / 'microk8s.profile'
         with pfile.open() as f:
             profile = yaml.safe_load(f)
-        self.client.profiles.create(self.profile, profile["config"], profile["devices"])
+        self.client.profiles.create(self.profile_name, profile["config"], profile["devices"])
 
     def start(self):
         """Start the node"""

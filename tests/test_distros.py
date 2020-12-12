@@ -19,13 +19,13 @@ class NotFound(Exception):
 
 
 class Node:
-    """A test node used to run tests"""
+    """A test node with executors"""
 
     def __init__(self):
         self.cmd = Executor(self)
         self.snap = Snap(self)
         self.microk8s = Microk8s(self)
-        self.kubernetes = Kubernetes(self)
+        self.kubernetes = Kubernetes(node=self)
 
 
 class LXD(Node):
@@ -278,12 +278,21 @@ class RetryWrapper:
 
 
 class Kubernetes:
-    """Node aware Kubernetes api commands"""
+    """Kubernetes api commands"""
 
-    def __init__(self, node):
+    def __init__(self, node=None, config=None):
         """Initialize the api"""
-        self.node = node
+
+        if not (node or config):
+            raise ValueError("Either node or config is required")
+        self.node = None
+        self.config = None
         self._api = None
+
+        if node:
+            self.node = node
+        elif config:
+            self.config = config
 
     @property
     def api(self):
@@ -293,13 +302,21 @@ class Kubernetes:
 
         config = kubernetes.client.configuration.Configuration.get_default_copy()
         # config.retries = 60
-        mk8s_config = yaml.safe_load(self.node.microk8s.config)
-        kubernetes.config.load_kube_config_from_dict(mk8s_config, client_configuration=config)
+        local_config = yaml.safe_load(self._get_config())
+        kubernetes.config.load_kube_config_from_dict(local_config, client_configuration=config)
         api_client = kubernetes.client.ApiClient(configuration=config)
         self._raw_api = kubernetes.client.CoreV1Api(api_client=api_client)
         self._api = RetryWrapper(self._raw_api, Exception)
 
         return self._api
+
+    def _get_config(self):
+        """Return config or retreive from microk8s"""
+
+        if self.config:
+            return self.config
+
+        return self.node.microk8s.config
 
     def wait_nodes_ready(self, count, timeout=60):
         """Wait for nodes to become ready"""

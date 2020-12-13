@@ -25,7 +25,7 @@ class Node:
         self.cmd = Executor(self)
         self.snap = Snap(self)
         self.microk8s = Microk8s(self)
-        self.kubernetes = Kubernetes(node=self)
+        self.kubernetes = Kubernetes(config=self.microk8s.get_config)
 
 
 class LXD(Node):
@@ -175,7 +175,10 @@ class Snap(Executor):
 
 
 class Addon:
-    """Base class for testing Microk8s addons"""
+    """
+    Base class for testing Microk8s addons.
+    Validation requires a Kubernetes executor on the node
+    """
 
     name = None
 
@@ -184,6 +187,9 @@ class Addon:
 
     def enable(self):
         return self.node.microk8s.enable([self.name])
+
+    def disable(self):
+        return self.node.microk8s.disable([self.name])
 
 
 class Dns(Addon):
@@ -248,6 +254,11 @@ class Microk8s(Executor):
         cmd = ["config"]
 
         return self.run_until_success(cmd)
+
+    def get_config(self):
+        """Return this nodes config"""
+
+        return self.config
 
     def start(self):
         """Start microks"""
@@ -343,20 +354,16 @@ class RetryWrapper:
 class Kubernetes:
     """Kubernetes api commands"""
 
-    def __init__(self, node=None, config=None):
-        """Initialize the api"""
+    def __init__(self, config):
+        """
+        Initialize the api
+        Config can be provided as a dictionary or a callable that will be evaluated when the
+        api is used the first time. If callable is provided the output will be run through
+        yaml_safeload to produce the config.
+        """
 
-        if not (node or config):
-            raise ValueError("Either node or config is required")
-        self.node = None
-        self.config = None
+        self._config = config
         self._api = None
-        self.api_client = None
-
-        if node:
-            self.node = node
-        elif config:
-            self.config = config
 
     @property
     def api(self):
@@ -366,7 +373,7 @@ class Kubernetes:
 
         config = kubernetes.client.configuration.Configuration.get_default_copy()
         # config.retries = 60
-        local_config = yaml.safe_load(self._get_config())
+        local_config = self.config
         kubernetes.config.load_kube_config_from_dict(local_config, client_configuration=config)
         api_client = kubernetes.client.ApiClient(configuration=config)
         self._raw_api = kubernetes.client.CoreV1Api(api_client=api_client)
@@ -374,25 +381,22 @@ class Kubernetes:
 
         return self._api
 
-    def _get_config(self):
-        """Return config or retreive from microk8s"""
+    @property
+    def config(self):
+        """Return config"""
 
-        if self.config:
-            return self.config
+        if callable(self._config):
+            self._config = yaml.safe_load(self._config())
 
-        return self.node.microk8s.config
+        return self._config
 
     def get_service_proxy(self, name, namespace, path=None):
         """Return a GET call to a proxied service"""
 
         if path:
-            response = self.node.kubernetes.api.connect_get_namespaced_service_proxy(
-                name, namespace, path
-            )
+            response = self.api.connect_get_namespaced_service_proxy(name, namespace, path)
         else:
-            response = self.node.kubernetes.api.connect_get_namespaced_service_proxy(
-                name, namespace
-            )
+            response = self.api.connect_get_namespaced_service_proxy(name, namespace)
 
         return response
 

@@ -215,6 +215,22 @@ class Dashboard(Addon):
         assert "Kubernetes Dashboard" in result
 
 
+class Storage(Addon):
+    """Storage addon"""
+
+    name = "storage"
+
+    def validate(self):
+        self.node.kubernetes.wait_containers_ready(
+            "kube-system", label="k8s-app=hostpath-provisioner"
+        )
+        claim = self.node.kubernetes.create_pvc(
+            "testpvc", "kube-system", storage_class="microk8s-hostpath", wait=True
+        )
+        assert claim.spec.storage_class_name == 'microk8s-hostpath'
+        self.node.kubernetes.delete_pvc("testpvc", "kube-system")
+
+
 class Microk8s(Executor):
     """Node aware MicroK8s executor"""
 
@@ -224,6 +240,7 @@ class Microk8s(Executor):
         super().__init__(*args, **kwargs)
         self.dns = Dns(self.node)
         self.dashboard = Dashboard(self.node)
+        self.storage = Storage(self.node)
 
     @property
     def config(self):
@@ -334,6 +351,7 @@ class Kubernetes:
         self.node = None
         self.config = None
         self._api = None
+        self.api_client = None
 
         if node:
             self.node = node
@@ -377,6 +395,56 @@ class Kubernetes:
             )
 
         return response
+
+    def create_pvc(
+        self,
+        name,
+        namespace,
+        storage="1G",
+        access=["ReadWriteOnce"],
+        storage_class=None,
+        wait=False,
+    ):
+        """Create a PVC"""
+        claim = kubernetes.client.V1PersistentVolumeClaim()
+        spec = kubernetes.client.V1PersistentVolumeClaimSpec()
+        metadata = kubernetes.client.V1ObjectMeta()
+        resources = kubernetes.client.V1ResourceRequirements()
+        metadata.name = name
+        resources.requests = {}
+        resources.requests["storage"] = storage
+        spec.access_modes = access
+        spec.resources = resources
+
+        if storage_class:
+            spec.storage_class_name = storage_class
+        claim.metadata = metadata
+        claim.spec = spec
+
+        if wait:
+            self.api.create_namespaced_persistent_volume_claim(namespace, claim)
+
+            return self.wait_pvc_phase(name, namespace)
+        else:
+            return self.api.create_namespaced_persistent_volume_claim(namespace, claim)
+
+    def delete_pvc(self, name, namespace):
+        """Delete a PVC"""
+
+        return self.api.delete_namespaced_persistent_volume_claim(name, namespace)
+
+    def wait_pvc_phase(self, name, namespace, phase="Bound", timeout=60):
+        """Wait for a PVC to enter the given phase"""
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=timeout)
+
+        while True:
+            claim = self.api.read_namespaced_persistent_volume_claim_status(name, namespace)
+
+            if claim.status.phase == phase:
+                return claim
+            elif datetime.datetime.now() > deadline:
+                raise TimeoutError(f"Timeout waiting for {name} to become {phase}")
+            time.sleep(0.5)
 
     def wait_nodes_ready(self, count, timeout=60):
         """Wait for nodes to become ready"""
@@ -528,6 +596,11 @@ class InstallTests:
         """Test dashboard addon"""
         self.node.microk8s.dashboard.enable()
         self.node.microk8s.dashboard.validate()
+
+    def test_storage(self):
+        """Test storage addon"""
+        self.node.microk8s.storage.enable()
+        self.node.microk8s.storage.validate()
 
 
 class UpgradeTests(InstallTests):

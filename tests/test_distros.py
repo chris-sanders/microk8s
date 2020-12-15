@@ -49,15 +49,15 @@ class Lxd(Node):
             self.__setup_profile()
             print(f"creating container {image}")
             config = {
-                'name': f'{self.__class__.__name__.lower()}-{self.__hash__()}',
-                'source': {
-                    'type': 'image',
+                "name": f"{self.__class__.__name__.lower()}-{self.__hash__()}",
+                "source": {
+                    "type": "image",
                     "mode": "pull",
                     "server": "https://cloud-images.ubuntu.com/daily",
                     "protocol": "simplestreams",
-                    'alias': image,
+                    "alias": image,
                 },
-                'profiles': ['default', self.profile_name],
+                "profiles": ["default", self.profile_name],
             }
             self.container = self.client.containers.create(config=config, wait=True)
 
@@ -68,7 +68,7 @@ class Lxd(Node):
             return
 
         cwd = Path(__file__).parent
-        pfile = cwd / 'lxc' / 'microk8s.profile'
+        pfile = cwd / "lxc" / "microk8s.profile"
         with pfile.open() as f:
             profile = yaml.safe_load(f)
         self.client.profiles.create(self.profile_name, profile["config"], profile["devices"])
@@ -107,7 +107,7 @@ class Lxd(Node):
     def get_primary_address(self):
         """Get the primary interface ip address"""
 
-        return self.container.state().network['eth0']['addresses'][0]['address']
+        return self.container.state().network["eth0"]["addresses"][0]["address"]
 
 
 class XenialLxd(Lxd):
@@ -181,7 +181,7 @@ class Executor:
 class Snap(Executor):
     """Node aware SNAP executor"""
 
-    prefix = ['snap']
+    prefix = ["snap"]
 
     def install(self, snap, channel, classic=False):
         """Install a snap"""
@@ -221,7 +221,7 @@ class Addon:
     def apply_template(self, template, context={}, yml=False):
         # Create manifest
         cwd = Path(__file__).parent
-        template = cwd / 'templates' / template
+        template = cwd / "templates" / template
         with template.open() as f:
             rendered = Template(f.read()).render(context)
         render_path = f"/tmp/{template.stem}.yaml"
@@ -276,7 +276,7 @@ class Storage(Addon):
         claim = self.node.kubernetes.create_pvc(
             "testpvc", "kube-system", storage_class="microk8s-hostpath", wait=True
         )
-        assert claim.spec.storage_class_name == 'microk8s-hostpath'
+        assert claim.spec.storage_class_name == "microk8s-hostpath"
         self.node.kubernetes.delete_pvc("testpvc", "kube-system")
 
 
@@ -305,8 +305,10 @@ class Ingress(Addon):
         assert "127.0.0.1" in xip_addresses[0].ip
 
         deadline = datetime.datetime.now() + datetime.timedelta(seconds=30)
+
         while True:
             resp = requests.get(f"http://microbot.{context['address']}.nip.io/")
+
             if resp.status_code == 200 or datetime.datetime.now() > deadline:
                 break
             time.sleep(1)
@@ -314,8 +316,10 @@ class Ingress(Addon):
         assert "microbot.png" in resp.content.decode("utf8")
 
         deadline = datetime.datetime.now() + datetime.timedelta(seconds=30)
+
         while True:
             resp = requests.get(f"http://microbot.{context['address']}.xip.io/")
+
             if resp.status_code == 200 or datetime.datetime.now() > deadline:
                 break
             time.sleep(1)
@@ -348,7 +352,9 @@ class Registry(Addon):
     name = "registry"
 
     def validate(self):
-        self.node.kubernetes.wait_containers_ready("container-registry", label="app=registry")
+        self.node.kubernetes.wait_containers_ready(
+            "container-registry", label="app=registry", timeout=300
+        )
         claim = self.node.kubernetes.wait_pvc_phase("registry-claim", "container-registry")
         assert "20Gi" in claim.status.capacity["storage"]
 
@@ -399,7 +405,7 @@ class Jaeger(Addon):
 
     def validate(self):
         self.node.kubernetes.wait_containers_ready("default", label="name=jaeger-operator")
-        self.node.kubernetes.wait_ingress_ready("simplest-query", "default")
+        self.node.kubernetes.wait_ingress_ready("simplest-query", "default", timeout=120)
 
 
 class Metallb(Addon):
@@ -640,13 +646,29 @@ class Kubernetes:
 
         return self._config
 
-    def get_raw_api(self, url):
+    def get_raw_api(self, url, timeout=60):
         self.api
-        resp = self.api_client.call_api(
-            url, 'GET', auth_settings=['BearerToken'], response_type='yaml', _preload_content=False
-        )
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=timeout)
 
-        return yaml.safe_load(resp[0].data.decode('utf8'))
+        while True:
+            try:
+                resp = self.api_client.call_api(
+                    url,
+                    "GET",
+                    auth_settings=["BearerToken"],
+                    response_type="yaml",
+                    _preload_content=False,
+                )
+
+                break
+            except kubernetes.client.exceptions.ApiException:
+                pass
+
+            if datetime.datetime.now() > deadline:
+                break
+            time.sleep(1)
+
+        return yaml.safe_load(resp[0].data.decode("utf8"))
 
     def create_from_yaml(self, yaml_file, verbose=False, namespace="default"):
         """Create objcets from yaml input"""
@@ -935,7 +957,7 @@ class InstallTests:
         self.node.microk8s.registry.enable()
         self.node.microk8s.registry.validate()
 
-    def test_metrics_erver(self):
+    def test_metrics_server(self):
         """Test metrics-server addon"""
         self.node.microk8s.metrics_server.enable()
         self.node.microk8s.metrics_server.validate()
@@ -969,13 +991,13 @@ class TestXenialUpgrade(UpgradeTests):
     node_type = XenialLxd
 
 
-# class TestBionicUpgrade(UpgradeTests):
-#     """Run Upgrade tests on a Bionic node"""
-#
-#     node_type = BionicLxd
+class TestBionicUpgrade(UpgradeTests):
+    """Run Upgrade tests on a Bionic node"""
+
+    node_type = BionicLxd
 
 
-# class TestFocalUpgrade(UpgradeTests):
-#     """Run Upgrade tests on a Focal node"""
-#
-#     node_type = FocalLxd
+class TestFocalUpgrade(UpgradeTests):
+    """Run Upgrade tests on a Focal node"""
+
+    node_type = FocalLxd

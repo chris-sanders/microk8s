@@ -8,6 +8,8 @@ import inspect
 import os
 import time
 
+from jinja2 import Template
+import requests
 import yaml
 
 import kubernetes
@@ -24,11 +26,13 @@ class Node:
     def __init__(self):
         self.cmd = Executor(self)
         self.snap = Snap(self)
+        self.kubectl = Kubectl(self)
+        self.docker = Docker(self)
         self.microk8s = Microk8s(self)
         self.kubernetes = Kubernetes(config=self.microk8s.get_config)
 
 
-class LXD(Node):
+class Lxd(Node):
     """LXD Node type for testing in containers"""
 
     profile_name = "microk8s"
@@ -87,12 +91,26 @@ class LXD(Node):
     def check_output(self, cmd):
         """Check execution of a command"""
         exit_code, stdout, stderr = self.container.execute(cmd)
-        CompletedProcess(cmd, exit_code, stdout, stderr).check_returncode()
+        try:
+            CompletedProcess(cmd, exit_code, stdout, stderr).check_returncode()
+        except CalledProcessError as e:
+            print(f"Stdout: {stdout}\r" f"Stderr: {stderr}\r")
+            raise e
 
         return stdout
 
+    def write(self, dest, contents):
+        """Write contents at destination on node"""
 
-class XenialLxd(LXD):
+        return self.container.files.put(dest, contents)
+
+    def get_primary_address(self):
+        """Get the primary interface ip address"""
+
+        return self.container.state().network['eth0']['addresses'][0]['address']
+
+
+class XenialLxd(Lxd):
     """Xenial LXD Node"""
 
     def __init__(self, name=None):
@@ -102,7 +120,7 @@ class XenialLxd(LXD):
             super().__init__(image="xenial/amd64")
 
 
-class BionicLxd(LXD):
+class BionicLxd(Lxd):
     """Bionic LXD Node"""
 
     def __init__(self, name=None):
@@ -112,7 +130,7 @@ class BionicLxd(LXD):
             super().__init__(image="bionic/amd64")
 
 
-class FocalLxd(LXD):
+class FocalLxd(Lxd):
     """Focal LXD Node"""
 
     def __init__(self, name=None):
@@ -157,7 +175,7 @@ class Executor:
                 if datetime.datetime.now() > deadline:
                     raise
                 print("Retrying {}".format(cmd))
-                time.sleep(3)
+                time.sleep(1)
 
 
 class Snap(Executor):
@@ -174,10 +192,19 @@ class Snap(Executor):
         self.run_until_success(cmd)
 
 
+class Docker(Executor):
+    """Node aware Docker executor"""
+
+    prefix = ["docker"]
+
+    def cmd(self, args):
+        self.run_until_success(args)
+
+
 class Addon:
     """
     Base class for testing Microk8s addons.
-    Validation requires a Kubernetes executor on the node
+    Validation requires a Kubernetes instance on the node
     """
 
     name = None
@@ -190,6 +217,23 @@ class Addon:
 
     def disable(self):
         return self.node.microk8s.disable([self.name])
+
+    def apply_template(self, template, context={}, yml=False):
+        # Create manifest
+        cwd = Path(__file__).parent
+        template = cwd / 'templates' / template
+        with template.open() as f:
+            rendered = Template(f.read()).render(context)
+        render_path = f"/tmp/{template.stem}.yaml"
+        self.node.write(render_path, rendered)
+
+        return self.node.microk8s.kubectl.apply(["-f", render_path], yml=yml)
+
+    def delete_template(self, template, context={}, yml=False):
+        path = Path(template)
+        render_path = f"/tmp/{path.stem}.yaml"
+
+        return self.node.microk8s.kubectl.delete(["-f", render_path], yml=yml)
 
 
 class Dns(Addon):
@@ -217,7 +261,6 @@ class Dashboard(Addon):
         )
         name = "https:kubernetes-dashboard:"
         result = self.node.kubernetes.get_service_proxy(name=name, namespace="kube-system")
-        print(result)
         assert "Kubernetes Dashboard" in result
 
 
@@ -237,16 +280,211 @@ class Storage(Addon):
         self.node.kubernetes.delete_pvc("testpvc", "kube-system")
 
 
+class Ingress(Addon):
+    """Ingress addon"""
+
+    name = "ingress"
+
+    def validate(self):
+        # TODO: Is this still needed?
+        # self.node.kubernetes.wait_containers_ready("default", label="app=default-http-backend")
+        # self.node.kubernetes.wait_containers_ready("default", label="name=nginx-ingress-microk8s")
+        self.node.kubernetes.wait_containers_ready("ingress", label="name=nginx-ingress-microk8s")
+
+        # Create manifest
+        context = {
+            "arch": "amd64",
+            "address": self.node.get_primary_address(),
+        }
+        self.apply_template("ingress.j2", context)
+
+        self.node.kubernetes.wait_containers_ready("default", label="app=microbot")
+        nip_addresses = self.node.kubernetes.wait_ingress_ready("microbot-ingress-nip", "default")
+        xip_addresses = self.node.kubernetes.wait_ingress_ready("microbot-ingress-xip", "default")
+        assert "127.0.0.1" in nip_addresses[0].ip
+        assert "127.0.0.1" in xip_addresses[0].ip
+
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=30)
+        while True:
+            resp = requests.get(f"http://microbot.{context['address']}.nip.io/")
+            if resp.status_code == 200 or datetime.datetime.now() > deadline:
+                break
+            time.sleep(1)
+        assert resp.status_code == 200
+        assert "microbot.png" in resp.content.decode("utf8")
+
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=30)
+        while True:
+            resp = requests.get(f"http://microbot.{context['address']}.xip.io/")
+            if resp.status_code == 200 or datetime.datetime.now() > deadline:
+                break
+            time.sleep(1)
+        assert resp.status_code == 200
+        assert "microbot.png" in resp.content.decode("utf8")
+
+        self.delete_template("ingress.j2", context)
+
+
+class Gpu(Addon):
+    """Gpu addon"""
+
+    name = "gpu"
+
+    def validate(self):
+        self.node.kubernetes.wait_containers_ready(
+            "kube-system", label="name=nvidia-device-plugin-ds"
+        )
+
+        # Create manifest
+        context = {}
+        self.apply_template("cuda-add.j2", context)
+        # TODO: Finish validator on hardware with GPU
+        self.delete_template("cuda-add.j2", context)
+
+
+class Registry(Addon):
+    """Registry addon"""
+
+    name = "registry"
+
+    def validate(self):
+        self.node.kubernetes.wait_containers_ready("container-registry", label="app=registry")
+        claim = self.node.kubernetes.wait_pvc_phase("registry-claim", "container-registry")
+        assert "20Gi" in claim.status.capacity["storage"]
+
+        self.node.docker.cmd(["pull", "busybox"])
+        self.node.docker.cmd(["tag", "busybox", "localhost:32000/my-busybox"])
+        self.node.docker.cmd(["push", "localhost:32000/my-busybox"])
+
+        context = {"image": "localhost:32000/my-busybox"}
+        self.apply_template("bbox.j2", context)
+
+        self.node.kubernetes.wait_containers_ready("default", field="metadata.name=busybox")
+        pods = self.node.kubernetes.get_pods("default", field="metadata.name=busybox")
+        assert pods[0].spec.containers[0].image == "localhost:32000/my-busybox"
+
+        self.delete_template("bbox.j2", context)
+
+
+class MetricsServer(Addon):
+
+    name = "metrics-server"
+
+    def validate(self):
+        self.node.kubernetes.wait_containers_ready("kube-system", label="k8s-app=metrics-server")
+        metrics_uri = "/apis/metrics.k8s.io/v1beta1/pods"
+        reply = self.node.kubernetes.get_raw_api(metrics_uri)
+        assert reply["kind"] == "PodMetricsList"
+
+
+class Fluentd(Addon):
+
+    name = "fluentd"
+
+    def validate(self):
+        self.node.kubernetes.wait_containers_ready(
+            "kube-system", field="metadata.name=elasticsearch-logging-0", timeout=300
+        )
+        self.node.kubernetes.wait_containers_ready(
+            "kube-system", label="k8s-app=fluentd-es", timeout=300
+        )
+        self.node.kubernetes.wait_containers_ready(
+            "kube-system", label="k8s-app=kibana-logging", timeout=300
+        )
+
+
+class Jaeger(Addon):
+
+    name = "jaeger"
+
+    def validate(self):
+        self.node.kubernetes.wait_containers_ready("default", label="name=jaeger-operator")
+        self.node.kubernetes.wait_ingress_ready("simplest-query", "default")
+
+
+class Metallb(Addon):
+
+    name = "metallb"
+
+    def enable(self, ip_ranges=None):
+        if not ip_ranges:
+            return self.node.microk8s.enable([self.name])
+        else:
+            return self.node.microk8s.enable([f"{self.name}:{ip_ranges}"])
+
+    def validate(self, ip_ranges=None):
+        context = {}
+        self.apply_template("load-balancer.j2", context)
+        ip = self.node.kubernetes.wait_load_balancer_ip("default", "example-service")
+
+        if ip_ranges:
+            assert ip in ip_ranges
+        self.delete_template("load-balancer.j2", context)
+
+
+class Kubectl(Executor):
+    """Node aware Microk8s Kubectl executor"""
+
+    prefix = ["kubectl"]
+
+    def __init__(self, *args, prefix=None, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if prefix and isinstance(prefix, list):
+            self.prefix = prefix + self.prefix
+            print(f"Using modified prefix: {self.prefix}")
+
+    def result(self, cmds, yml):
+        """Return commands optionally as yaml"""
+
+        if yml:
+            cmds.append("-oyaml")
+
+            return yaml.safe_load(self.run_until_success(cmds))
+
+        return self.run_until_success(cmds)
+
+    def get(self, args, yml=True):
+
+        cmd = ["get"]
+        cmd.extend(args)
+
+        return self.result(cmd, yml)
+
+    def apply(self, args, yml=True):
+
+        cmd = ["apply"]
+        cmd.extend(args)
+
+        return self.result(cmd, yml)
+
+    def delete(self, args, yml=True):
+        cmd = ["delete"]
+        cmd.extend(args)
+
+        return self.result(cmd, yml)
+
+
 class Microk8s(Executor):
     """Node aware MicroK8s executor"""
 
-    prefix = ["/snap/bin/microk8s"]
+    prefix = [
+        "/snap/bin/microk8s",
+    ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.kubectl = Kubectl(self.node, prefix=self.prefix)
         self.dns = Dns(self.node)
         self.dashboard = Dashboard(self.node)
         self.storage = Storage(self.node)
+        self.ingress = Ingress(self.node)
+        self.gpu = Gpu(self.node)
+        self.registry = Registry(self.node)
+        self.metrics_server = MetricsServer(self.node)
+        self.fluentd = Fluentd(self.node)
+        self.jaeger = Jaeger(self.node)
+        self.metallb = Metallb(self.node)
 
     @property
     def config(self):
@@ -290,7 +528,7 @@ class Microk8s(Executor):
 
             if "microk8s is running" in status:
                 return
-            elif datetime.datetime.now > deadline:
+            elif datetime.datetime.now() > deadline:
                 raise TimeoutError("Timeout waiting for microk8s status")
             time.sleep(1)
 
@@ -364,6 +602,7 @@ class Kubernetes:
 
         self._config = config
         self._api = None
+        self._api_network = None
 
     @property
     def api(self):
@@ -375,11 +614,22 @@ class Kubernetes:
         # config.retries = 60
         local_config = self.config
         kubernetes.config.load_kube_config_from_dict(local_config, client_configuration=config)
-        api_client = kubernetes.client.ApiClient(configuration=config)
-        self._raw_api = kubernetes.client.CoreV1Api(api_client=api_client)
+        self.api_client = kubernetes.client.ApiClient(configuration=config)
+        self._raw_api = kubernetes.client.CoreV1Api(api_client=self.api_client)
         self._api = RetryWrapper(self._raw_api, Exception)
 
         return self._api
+
+    @property
+    def api_network(self):
+        if self._api_network:
+            return self._api_network
+
+        self.api  # Ensure the core api has been setup
+        self._raw_api_network = kubernetes.client.NetworkingV1beta1Api(api_client=self.api_client)
+        self._api_network = RetryWrapper(self._raw_api_network, Exception)
+
+        return self._api_network
 
     @property
     def config(self):
@@ -389,6 +639,24 @@ class Kubernetes:
             self._config = yaml.safe_load(self._config())
 
         return self._config
+
+    def get_raw_api(self, url):
+        self.api
+        resp = self.api_client.call_api(
+            url, 'GET', auth_settings=['BearerToken'], response_type='yaml', _preload_content=False
+        )
+
+        return yaml.safe_load(resp[0].data.decode('utf8'))
+
+    def create_from_yaml(self, yaml_file, verbose=False, namespace="default"):
+        """Create objcets from yaml input"""
+
+        if not self.api_client:
+            self.api  # Accessing the api creates an api_client
+
+        return kubernetes.utils.create_from_yaml(
+            k8s_client=self.api_client, yaml_file=yaml_file, verbose=verbose, namespace=namespace
+        )
 
     def get_service_proxy(self, name, namespace, path=None):
         """Return a GET call to a proxied service"""
@@ -490,24 +758,55 @@ class Kubernetes:
 
         raise NotFound(f"cluster_ip not found for {name} in {namespace}")
 
-    def get_pod_by_label(self, namespace, label):
-        """Get a pod by lable"""
-        pod_list = self.api.list_namespaced_pod(namespace, label_selector=label)
+    def get_service_load_balancer_ip(self, namespace, name):
+        """Get an LB IP for a service by name"""
+        service_list = self.api.list_namespaced_service(namespace)
+
+        if not service_list.items:
+            raise NotFound(f"No services in namespace {namespace}")
+
+        for service in service_list.items:
+            if service.metadata.name == name:
+                try:
+                    return service.status.load_balancer.ingress[0].ip
+                except TypeError:
+                    pass
+
+        raise NotFound(f"load_balancer_ip not found for {name} in {namespace}")
+
+    def wait_load_balancer_ip(self, namespace, name, timeout=60):
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=timeout)
+
+        while True:
+            try:
+                ip = self.get_service_load_balancer_ip(namespace, name)
+
+                if ip:
+                    return ip
+            except NotFound:
+                pass
+
+            if datetime.datetime.now() > deadline:
+                raise TimeoutError(f"Timeout waiting for {name} in {namespace}")
+            time.sleep(1)
+
+    def get_pods(self, namespace, label=None, field=None):
+        """Get pod list"""
+        pod_list = self.api.list_namespaced_pod(
+            namespace, label_selector=label, field_selector=field
+        )
 
         if not pod_list.items:
             raise NotFound(f"No pods in namespace {namespace} with label {label}")
 
         return pod_list.items
 
-    def all_containers_ready(self, namespace, label=None):
+    def all_containers_ready(self, namespace, label=None, field=None):
         """Check if all containers in all pods are ready"""
 
         ready = True
 
-        if label:
-            pods = self.api.list_namespaced_pod(namespace, label_selector=label)
-        else:
-            pods = self.api.list_namespaced_pod(namespace)
+        pods = self.api.list_namespaced_pod(namespace, label_selector=label, field_selector=field)
 
         if not len(pods.items):
             return False
@@ -521,15 +820,29 @@ class Kubernetes:
 
         return ready
 
-    def wait_containers_ready(self, namespace, label=None, timeout=60):
+    def wait_containers_ready(self, namespace, label=None, field=None, timeout=60):
         """Wait up to timeout for all containers to be ready."""
         deadline = datetime.datetime.now() + datetime.timedelta(seconds=timeout)
 
         while True:
-            if self.all_containers_ready(namespace, label):
+            if self.all_containers_ready(namespace, label, field):
                 return
             elif datetime.datetime.now() > deadline:
                 raise TimeoutError(f"Timeout waiting for containers in {namespace}")
+            else:
+                time.sleep(1)
+
+    def wait_ingress_ready(self, name, namespace, timeout=60):
+        """Wait for an ingress to get an address"""
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=timeout)
+
+        while True:
+            result = self.api_network.read_namespaced_ingress(name, namespace)
+
+            if result.status.load_balancer.ingress is not None:
+                return result.status.load_balancer.ingress
+            elif datetime.datetime.now() > deadline:
+                raise TimeoutError(f"Timeout waiting for Ingress {name}")
             else:
                 time.sleep(1)
 
@@ -606,6 +919,43 @@ class InstallTests:
         self.node.microk8s.storage.enable()
         self.node.microk8s.storage.validate()
 
+    def test_ingress(self):
+        """Test ingress addon"""
+        self.node.microk8s.ingress.enable()
+        self.node.microk8s.ingress.validate()
+
+    # def test_gpu(self):
+    #     """Test gpu addon"""
+    #     self.node.microk8s.gpu.enable()
+    #     self.node.microk8s.gpu.validate()
+
+    def test_registry(self):
+        """Test registry addon"""
+        self.node.snap.install("docker", channel="stable", classic=True)
+        self.node.microk8s.registry.enable()
+        self.node.microk8s.registry.validate()
+
+    def test_metrics_erver(self):
+        """Test metrics-server addon"""
+        self.node.microk8s.metrics_server.enable()
+        self.node.microk8s.metrics_server.validate()
+
+    def test_fluentd(self):
+        """Test fluentd addon"""
+        self.node.microk8s.fluentd.enable()
+        self.node.microk8s.fluentd.validate()
+
+    def test_jaeger(self):
+        """Test Jaeger"""
+        self.node.microk8s.jaeger.enable()
+        self.node.microk8s.jaeger.validate()
+
+    def test_metallb(self):
+        """Test Metallb"""
+        ip_ranges = "192.168.0.105-192.168.0.105,192.168.0.110-192.168.0.111,192.168.1.240/28"
+        self.node.microk8s.metallb.enable(ip_ranges)
+        self.node.microk8s.metallb.validate(ip_ranges)
+
 
 class UpgradeTests(InstallTests):
     """Upgrade after an install"""
@@ -619,10 +969,10 @@ class TestXenialUpgrade(UpgradeTests):
     node_type = XenialLxd
 
 
-class TestBionicUpgrade(UpgradeTests):
-    """Run Upgrade tests on a Bionic node"""
-
-    node_type = BionicLxd
+# class TestBionicUpgrade(UpgradeTests):
+#     """Run Upgrade tests on a Bionic node"""
+#
+#     node_type = BionicLxd
 
 
 # class TestFocalUpgrade(UpgradeTests):
